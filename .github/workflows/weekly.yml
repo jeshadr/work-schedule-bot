@@ -1,0 +1,58 @@
+name: work-schedule-bot-weekly
+
+on:
+  schedule:
+    # Mondays 14:05 UTC = 07:05 Phoenix all year
+    - cron: "5 14 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Recreate OAuth files from Secrets
+      - name: Write credentials.json
+        run: |
+          cat > credentials.json <<'JSON'
+          ${{ secrets.CREDENTIALS_JSON }}
+          JSON
+      - name: Write token.json
+        run: |
+          cat > token.json <<'JSON'
+          ${{ secrets.GMAIL_TOKEN_JSON }}
+          JSON
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+
+          # Keep these aligned with your DB
+          NOTION_TITLE_PROP: Task
+          NOTION_DATE_PROP: Date
+          NOTION_TIME_PROP: Time
+          NOTION_LOCATION_PROP: Location
+          NOTION_NOTES_PROP: Notes
+          NOTION_DAY_PROP: "Day of Week"
+
+          # Gmail and parsing config
+          GMAIL_QUERY: ${{ secrets.GMAIL_QUERY }}
+          TIMEZONE: America/Phoenix
+          YOUR_NAME: Jeshad
+          FILTER_BY_NAME: "true"
+        run: python run.py
