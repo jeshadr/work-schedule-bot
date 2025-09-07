@@ -1,0 +1,6 @@
+credentials.json
+token.json
+last_email.txt
+last_email.html
+.venv/
+.env
