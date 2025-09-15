@@ -97,16 +97,9 @@ def html_to_text(html: str) -> str:
 
 # ---------- Pick the right email ----------
 
-DAY_HEADER_LINE = re.compile(r"^\s*\d{1,2}\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
-                             re.IGNORECASE | re.MULTILINE)
-# token like 12 PM, 12:30 PM, 830AM, 9AM
+DAY_HEADER_LINE = re.compile(r"^\s*\d{1,2}\s+[A-Za-z]+\b", re.IGNORECASE | re.MULTILINE)
 TIME_TOKEN = r"(?:\d{1,2}(?::\d{2})?|\d{3,4})\s*(?:AM|PM|am|pm)?"
 TIME_RANGE_RE = re.compile(rf"{TIME_TOKEN}\s*-\s*{TIME_TOKEN}", re.IGNORECASE)
-
-WINDOW_SUBJECT_RE = re.compile(
-    r"\bschedule\b[^\\n]*?(?P<start_day>\d{1,2}(?:st|nd|rd|th)?)\s*[–-]\s*(?P<end_day>\d{1,2}(?:st|nd|rd|th)?)",
-    re.IGNORECASE,
-)
 
 def looks_like_schedule(subject: str, text: str, age_hours: float) -> tuple[int, dict]:
     subj = subject.lower()
@@ -120,24 +113,19 @@ def looks_like_schedule(subject: str, text: str, age_hours: float) -> tuple[int,
     has_numeric_window = bool(re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s*[–-]\s*\d{1,2}(?:st|nd|rd|th)?\b", subj))
 
     score = 0
-    score += min(day_headers, 5)               # up to +5 for day headers
-    score += min(time_ranges // 10, 5)         # up to +5 for lots of time rows
-    if has_schedule_word:
-        score += 2
-    if has_window_phrase or has_numeric_window:
-        score += 2
+    score += min(day_headers, 5)
+    score += min(time_ranges // 10, 5)
+    if has_schedule_word: score += 2
+    if has_window_phrase or has_numeric_window: score += 2
 
-    # Penalize “debrief” only if the subject does not also say schedule
+    # Only penalize 'debrief' if subject doesn't also say 'schedule'
     if "debrief" in subj and not has_schedule_word:
         score -= 3
 
     # Recency bonus
-    if age_hours <= 24:
-        score += 4
-    elif age_hours <= 72:
-        score += 2
-    elif age_hours <= 168:
-        score += 1
+    if age_hours <= 24: score += 4
+    elif age_hours <= 72: score += 2
+    elif age_hours <= 168: score += 1
 
     metrics = {
         "day_headers": day_headers,
@@ -148,21 +136,16 @@ def looks_like_schedule(subject: str, text: str, age_hours: float) -> tuple[int,
     }
     return score, metrics
 
-
 def fetch_latest_email(svc):
     resp = svc.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
     msgs = resp.get("messages", [])
     if not msgs:
         return None, None, ""
-
-    # newest first by id as a rough proxy
     msgs = list(reversed(sorted(msgs, key=lambda m: m["id"])))
-
     best = None
     best_score = -10**9
     best_metrics = {}
     best_age = 10**9
-
     for m in msgs:
         full = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
         payload = full.get("payload", {})
@@ -172,33 +155,33 @@ def fetch_latest_email(svc):
         html = extract_raw_html(payload)
         if not text:
             continue
-
-        # internalDate is ms since epoch
         internal_ms = int(full.get("internalDate", "0"))
         age_hours = (datetime.utcnow() - datetime.utcfromtimestamp(internal_ms / 1000)).total_seconds() / 3600.0
-
         score, metrics = looks_like_schedule(subject, text, age_hours)
-
-        # Prefer higher score, break near ties by recency
         if (score > best_score) or (score == best_score and age_hours < best_age):
             best = (subject, text, html)
             best_score = score
             best_metrics = metrics
             best_age = age_hours
-
     if best:
         logging.info("Chosen email: %s | score=%s metrics=%s", best[0], best_score, best_metrics)
     return best if best else (None, None, "")
 
-
 # ---------- Parsing ----------
 
+# “schedule for September 1st – 14th”
 WINDOW_RE = re.compile(
-    r"schedule\s+for\s+(?P<start>([A-Za-z]+\.?\s+)?[A-Za-z]+\s+\d{1,2}(st|nd|rd|th)?)\s*-\s*(?P<end_day>\d{1,2}(st|nd|rd|th)?)",
+    r"schedule\s+for\s+(?P<start>([A-Za-z]+\.?\s+)?[A-Za-z]+\s+\d{1,2}(st|nd|rd|th)?)\s*[–-]\s*(?P<end_day>\d{1,2}(st|nd|rd|th)?)",
     re.IGNORECASE,
 )
+# Subject like “Schedule 15th - 30th”
+WINDOW_SUBJECT_RE = re.compile(
+    r"\bschedule\b[^\\n]*?(?P<start_day>\d{1,2}(?:st|nd|rd|th)?)\s*[–-]\s*(?P<end_day>\d{1,2}(?:st|nd|rd|th)?)",
+    re.IGNORECASE,
+)
+# Be tolerant: after day number accept any word for the weekday, including typos like "Wednsday"
 DAY_HEADER_RE = re.compile(
-    r"^\s*(?P<daynum>\d{1,2})\s+(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b(?P<rest>.*)$",
+    r"^\s*(?P<daynum>\d{1,2})\s+(?P<weekday>[A-Za-z]+)\b(?P<rest>.*)$",
     re.IGNORECASE,
 )
 # allow 830AM with no colon and optional AM/PM on either side
@@ -220,20 +203,20 @@ def month_from_text(s: str) -> Optional[int]:
         return 9
     return None
 
-def parse_window(text: str, now: datetime) -> tuple[date, date]:
-    # First try full “schedule for September 1st - 14th”
-    m = WINDOW_RE.search(text)
+def parse_window(body_text: str, subject_text: str, now: datetime) -> tuple[date, date]:
+    # Try full phrase in body first
+    m = WINDOW_RE.search(body_text or "")
     if m:
         start_str = m.group("start")
         end_day_str = m.group("end_day")
         month = month_from_text(start_str) or now.month
-        start_day = int(re.sub(r"\\D", "", start_str))
+        start_day = int(re.sub(r"\D", "", start_str))
         start = date(now.year, month, start_day)
         if (start - now.date()).days > 120:
             start = date(now.year - 1, month, start_day)
         if (now.date() - start).days > 250:
             start = date(now.year + 1, month, start_day)
-        end_day = int(re.sub(r"\\D", "", end_day_str))
+        end_day = int(re.sub(r"\D", "", end_day_str))
         try:
             end = date(start.year, month, end_day)
         except ValueError:
@@ -249,12 +232,12 @@ def parse_window(text: str, now: datetime) -> tuple[date, date]:
                 end = last
         return start, end
 
-    # Fallback for subjects like “Schedule 15th - 30th”
-    m2 = WINDOW_SUBJECT_RE.search(text)
+    # Fallback: numeric window in subject “Schedule 15th - 30th”
+    m2 = WINDOW_SUBJECT_RE.search(subject_text or "")
     if m2:
         month = now.month
-        start_day = int(re.sub(r"\\D", "", m2.group("start_day")))
-        end_day = int(re.sub(r"\\D", "", m2.group("end_day")))
+        start_day = int(re.sub(r"\D", "", m2.group("start_day")))
+        end_day = int(re.sub(r"\D", "", m2.group("end_day")))
         start = date(now.year, month, start_day)
         try:
             end = date(now.year, month, end_day)
@@ -262,16 +245,14 @@ def parse_window(text: str, now: datetime) -> tuple[date, date]:
             last = (date(now.year, month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
             end = last
         if end < start:
-            # cross month
             nm_year = now.year + (1 if month == 12 else 0)
             nm_month = 1 if month == 12 else month + 1
-            end = date(nm_year, nm_month, end_day if end_day <= 28 else 28)
+            end = date(nm_year, nm_month, min(end_day, 28))
         return start, end
 
-    # No explicit window found, default to current week
+    # Default: current week
     ws = get_week_start(now).date()
     return ws, ws + timedelta(days=6)
-
 
 def get_week_start(dt: datetime) -> datetime:
     return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
@@ -296,6 +277,8 @@ TASK_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
+EARLY_OUT_RE = re.compile(r"\b(?:until|til|till)\s*(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)", re.IGNORECASE)
+
 def split_people_task(rest: str) -> tuple[str, str]:
     if not rest:
         return "", ""
@@ -310,10 +293,6 @@ def split_people_task(rest: str) -> tuple[str, str]:
     return rest.strip(), ""
 
 def normalize_time_token(tok: str, fallback_ampm: Optional[str] = None) -> str:
-    """
-    Turn 830AM -> 8:30 AM, 9AM -> 9 AM, 12:45pm -> 12:45 PM.
-    If token has no AM/PM and fallback is provided, use it.
-    """
     s = tok.strip().upper().replace(" ", "")
     m = re.match(r"(?P<h>\d{1,2})(?::?(?P<m>\d{2}))?(?P<ampm>AM|PM)?$", s)
     if not m:
@@ -322,21 +301,42 @@ def normalize_time_token(tok: str, fallback_ampm: Optional[str] = None) -> str:
     mm = m.group("m")
     ampm = m.group("ampm") or (fallback_ampm.upper() if fallback_ampm else None)
     if not mm:
-        mm = "00" if len(s) <= 2 else s[-3:-1] if re.match(r"\d{3,4}(AM|PM)?$", s) else "00"
+        if re.match(r"^\d{3,4}(AM|PM)?$", s):
+            mm = s[-3:-1] if len(s) == 5 else s[-3:-1] if len(s) == 4 else "00"
+        else:
+            mm = "00"
     return f"{h}:{mm} {ampm}" if ampm else f"{h}:{mm}"
 
 def normalize_time_range(t1: str, t2: str) -> str:
-    # If only second token has AM/PM, copy it to the first
     ampm2 = re.search(r"(AM|PM)", t2, re.IGNORECASE)
     fb = ampm2.group(1).upper() if ampm2 else None
     a = normalize_time_token(t1, fb)
     b = normalize_time_token(t2, fb)
-    # remove leading :00 minutes for whole hours if you prefer, but we keep them for clarity
     return f"{a} - {b}"
+
+def adjust_time_for_early_out(time_str: str, notes: str) -> Tuple[str, str]:
+    """Shorten end time if notes contain 'until/til/till X'."""
+    m = EARLY_OUT_RE.search(notes or "")
+    if not m:
+        return time_str, notes
+    # split existing range
+    m2 = re.match(r"^\s*(?P<a>.+?)\s*-\s*(?P<b>.+?)\s*$", time_str)
+    if not m2:
+        return time_str, notes
+    start_tok = m2.group("a")
+    end_tok = m2.group("b")
+    end_ampm = "PM" if re.search(r"PM", end_tok, re.IGNORECASE) else ("AM" if re.search(r"AM", end_tok, re.IGNORECASE) else None)
+    new_end = normalize_time_token(m.group("time"), end_ampm)
+    new_time = f"{start_tok} - {new_end}"
+    notes_clean = EARLY_OUT_RE.sub("", notes).strip()
+    notes_clean = re.sub(r"\(\s*\)", "", notes_clean).strip()
+    return new_time, notes_clean
 
 def parse_rows(subject: str, body: str, filter_by_name: bool = FILTER_BY_NAME) -> List[dict]:
     now = datetime.now(TZ)
-    window_start, window_end = parse_window(body or subject or "", now)
+    # FIX: consider BOTH body and subject for the date window
+    window_start, window_end = parse_window(body or "", subject or "", now)
+
     lines = [ln.strip() for ln in body.splitlines()]
     current_date: Optional[date] = None
     current_weekday: Optional[str] = None
@@ -349,15 +349,25 @@ def parse_rows(subject: str, body: str, filter_by_name: bool = FILTER_BY_NAME) -
 
         mday = DAY_HEADER_RE.match(line)
         if mday:
+            # Accept any weekday token including typos, we only trust the day number
             daynum = int(mday.group("daynum"))
             current_weekday = mday.group("weekday").capitalize()
+
+            # Build a candidate date in the window's month; handle rollover to next month if needed
             try:
                 candidate = date(window_start.year, window_start.month, daynum)
+                if candidate < window_start:
+                    # e.g., window is 15–30 and header says 1 -> next month
+                    nm_year = window_start.year + (1 if window_start.month == 12 else 0)
+                    nm_month = 1 if window_start.month == 12 else window_start.month + 1
+                    candidate = date(nm_year, nm_month, daynum)
             except ValueError:
+                # end-of-month edge cases
                 y = window_start.year + (1 if window_start.month == 12 else 0)
                 mth = 1 if window_start.month == 12 else window_start.month + 1
                 last = (date(y, mth, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
                 candidate = last
+
             current_date = candidate
 
             rest = mday.group("rest").strip()
@@ -381,12 +391,14 @@ def parse_rows(subject: str, body: str, filter_by_name: bool = FILTER_BY_NAME) -
     if filter_by_name:
         rows = [r for r in rows if re.search(rf"\b{re.escape(YOUR_NAME)}\b", r["People"], re.IGNORECASE)]
 
+    # window filter
     rows = [r for r in rows if window_start <= r["_date"] <= window_end]
 
+    # de-dup by date + time + location only
     seen = set()
     unique = []
     for r in rows:
-        key = (r["_date"].isoformat(), r["Time"], r["Location"], r["People"], r["Task"])
+        key = (r["_date"].isoformat(), r["Time"], r["Location"])
         if key not in seen:
             seen.add(key)
             unique.append(r)
@@ -395,6 +407,10 @@ def parse_rows(subject: str, body: str, filter_by_name: bool = FILTER_BY_NAME) -
 def add_row(results, d: date, weekday: Optional[str], t1: str, t2: str, location: str, people: str, task: str):
     day_name = weekday or datetime(d.year, d.month, d.day).strftime("%A")
     time_str = normalize_time_range(t1, t2)
+
+    # reflect early-out like "until 2:30" into Time
+    time_str, people = adjust_time_for_early_out(time_str, people)
+
     title_text = task.strip() if task.strip() else f"{location or 'Shift'} {time_str}".strip()
     results.append({
         "_title_content": title_text,
@@ -537,7 +553,7 @@ def main():
     rows = parse_rows(subject or "", body, filter_by_name=FILTER_BY_NAME)
 
     if not rows and FILTER_BY_NAME:
-        # Try again without the filter to diagnose
+        # Diagnose quickly
         all_rows = parse_rows(subject or "", body, filter_by_name=False)
         logging.warning("Parsed zero rows with name filter. Without filter there would be %d row(s).", len(all_rows))
         if all_rows:
