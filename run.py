@@ -6,7 +6,7 @@ import logging
 import warnings
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,26 +26,26 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Phoenix"))
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DB = os.getenv("NOTION_DATABASE_ID")
-assert NOTION_TOKEN and NOTION_DB, "Set NOTION_TOKEN and NOTION_DATABASE_ID in .env"
+assert NOTION_TOKEN and NOTION_DB, "Set NOTION_TOKEN and NOTION_DATABASE_ID in env or secrets"
 
-# Gmail search for the schedule
-GMAIL_QUERY = os.getenv("GMAIL_QUERY", "subject:(schedule OR shifts) newer_than:30d")
+GMAIL_QUERY = os.getenv("GMAIL_QUERY", 'subject:(schedule OR shifts) newer_than:30d')
 
 YOUR_NAME = os.getenv("YOUR_NAME", "Jeshad")
 FILTER_BY_NAME = os.getenv("FILTER_BY_NAME", "true").lower() in ("1", "true", "yes")
 
+# Optional explicit property mappings from your schema
 OV_TITLE     = os.getenv("NOTION_TITLE_PROP") or None   # Title
 OV_DATE      = os.getenv("NOTION_DATE_PROP") or None    # Date
 OV_DAY       = os.getenv("NOTION_DAY_PROP") or None     # Day of Week
 OV_TIME      = os.getenv("NOTION_TIME_PROP") or None    # Time
 OV_LOCATION  = os.getenv("NOTION_LOCATION_PROP") or None# Location
-OV_PEOPLE    = os.getenv("NOTION_PEOPLE_PROP") or None  # People
+OV_PEOPLE    = os.getenv("NOTION_PEOPLE_PROP") or None  # People or Notes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 KNOWN_SITES = {"Aeroterra", "CTEC", "Guadalupe", "Tempe", "Chandler", "Mesa", "Superior", "Sierra Vista"}
 
-# ---------------- Gmail helpers ----------------
+# ---------- Gmail helpers ----------
 
 def gmail_service():
     creds = None
@@ -60,23 +60,6 @@ def gmail_service():
         with open("token.json", "w") as token:
             token.write(creds.to_json())
     return build("gmail", "v1", credentials=creds)
-
-def fetch_latest_email(svc):
-    resp = svc.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=10).execute()
-    msgs = resp.get("messages", [])
-    if not msgs:
-        return None, None, ""
-    msgs = list(reversed(sorted(msgs, key=lambda m: m["id"])))
-    for m in msgs:
-        full = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
-        payload = full.get("payload", {})
-        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-        subject = headers.get("subject", "")
-        text = extract_body_text(payload)
-        html = extract_raw_html(payload)
-        if text:
-            return subject, text, html
-    return None, None, ""
 
 def extract_body_text(payload) -> str:
     def _walk(part):
@@ -112,18 +95,73 @@ def html_to_text(html: str) -> str:
         br.append("\n")
     return soup.get_text(separator="\n")
 
-# ---------------- Parsing ----------------
+# ---------- Pick the right email ----------
+
+DAY_HEADER_LINE = re.compile(r"^\s*\d{1,2}\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", re.IGNORECASE | re.MULTILINE)
+# token like 12 PM, 12:30 PM, 830AM, 9AM
+TIME_TOKEN = r"(?:\d{1,2}(?::\d{2})?|\d{3,4})\s*(?:AM|PM|am|pm)?"
+TIME_RANGE_RE = re.compile(rf"{TIME_TOKEN}\s*-\s*{TIME_TOKEN}", re.IGNORECASE)
+
+def looks_like_schedule(subject: str, text: str) -> Tuple[int, dict]:
+    """Return a score and some metrics. Higher score means more likely to be the schedule."""
+    subj = subject.lower()
+    body = text or ""
+    day_headers = len(DAY_HEADER_LINE.findall(body))
+    time_ranges = len(TIME_RANGE_RE.findall(body))
+    has_window = "schedule for" in body.lower() or "schedule for" in subj
+    has_keyword = any(k in subj for k in ("schedule", "shifts"))
+    score = 0
+    score += 3 if day_headers >= 2 else day_headers
+    score += 2 if time_ranges >= 4 else time_ranges
+    if has_window: score += 2
+    if has_keyword: score += 1
+    # penalize obvious debriefs
+    if "debrief" in subj:
+        score -= 3
+    return score, {"day_headers": day_headers, "time_ranges": time_ranges, "has_window": has_window}
+
+def fetch_latest_email(svc):
+    resp = svc.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
+    msgs = resp.get("messages", [])
+    if not msgs:
+        return None, None, ""
+    # newest first by id as a rough proxy
+    msgs = list(reversed(sorted(msgs, key=lambda m: m["id"])))
+    best = None
+    best_score = -999
+    best_metrics = {}
+    for m in msgs:
+        full = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
+        payload = full.get("payload", {})
+        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+        subject = headers.get("subject", "")
+        text = extract_body_text(payload)
+        html = extract_raw_html(payload)
+        if not text:
+            continue
+        score, metrics = looks_like_schedule(subject, text)
+        if score > best_score:
+            best = (subject, text, html)
+            best_score = score
+            best_metrics = metrics
+    if best:
+        logging.info("Chosen email: %s | score=%s metrics=%s", best[0], best_score, best_metrics)
+    return best if best else (None, None, "")
+
+# ---------- Parsing ----------
 
 WINDOW_RE = re.compile(
-    r"schedule\s+for\s+(?P<start>([A-Za-z]+\.?\s+)?[A-Za-z]+\s+\d{1,2}(st|nd|rd|th)?)\s*[–-]\s*(?P<end_day>\d{1,2}(st|nd|rd|th)?)",
+    r"schedule\s+for\s+(?P<start>([A-Za-z]+\.?\s+)?[A-Za-z]+\s+\d{1,2}(st|nd|rd|th)?)\s*-\s*(?P<end_day>\d{1,2}(st|nd|rd|th)?)",
     re.IGNORECASE,
 )
 DAY_HEADER_RE = re.compile(
     r"^\s*(?P<daynum>\d{1,2})\s+(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b(?P<rest>.*)$",
     re.IGNORECASE,
 )
+# allow 830AM with no colon and optional AM/PM on either side
 TIME_ROW_RE = re.compile(
-    r"(?P<t1>\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(?P<t2>\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s+(?P<tail>.+)$"
+    rf"(?P<t1>{TIME_TOKEN})\s*-\s*(?P<t2>{TIME_TOKEN})\s+(?P<tail>.+)$",
+    re.IGNORECASE,
 )
 
 MONTHS = {m.lower(): i for i, m in enumerate(
@@ -205,12 +243,32 @@ def split_people_task(rest: str) -> tuple[str, str]:
         return rest[:kstart].strip(" ,;-"), rest[kstart:].strip(" ,;-")
     return rest.strip(), ""
 
-def normalize_time(t: str) -> str:
-    t = t.strip().upper().replace(" ", "")
-    t = re.sub(r"(AM|PM)$", r" \1", t)
-    return t
+def normalize_time_token(tok: str, fallback_ampm: Optional[str] = None) -> str:
+    """
+    Turn 830AM -> 8:30 AM, 9AM -> 9 AM, 12:45pm -> 12:45 PM.
+    If token has no AM/PM and fallback is provided, use it.
+    """
+    s = tok.strip().upper().replace(" ", "")
+    m = re.match(r"(?P<h>\d{1,2})(?::?(?P<m>\d{2}))?(?P<ampm>AM|PM)?$", s)
+    if not m:
+        return tok.strip()
+    h = int(m.group("h"))
+    mm = m.group("m")
+    ampm = m.group("ampm") or (fallback_ampm.upper() if fallback_ampm else None)
+    if not mm:
+        mm = "00" if len(s) <= 2 else s[-3:-1] if re.match(r"\d{3,4}(AM|PM)?$", s) else "00"
+    return f"{h}:{mm} {ampm}" if ampm else f"{h}:{mm}"
 
-def parse_rows(subject: str, body: str) -> list[dict]:
+def normalize_time_range(t1: str, t2: str) -> str:
+    # If only second token has AM/PM, copy it to the first
+    ampm2 = re.search(r"(AM|PM)", t2, re.IGNORECASE)
+    fb = ampm2.group(1).upper() if ampm2 else None
+    a = normalize_time_token(t1, fb)
+    b = normalize_time_token(t2, fb)
+    # remove leading :00 minutes for whole hours if you prefer, but we keep them for clarity
+    return f"{a} - {b}"
+
+def parse_rows(subject: str, body: str, filter_by_name: bool = FILTER_BY_NAME) -> List[dict]:
     now = datetime.now(TZ)
     window_start, window_end = parse_window(body or subject or "", now)
     lines = [ln.strip() for ln in body.splitlines()]
@@ -253,7 +311,8 @@ def parse_rows(subject: str, body: str) -> list[dict]:
             add_row(rows, current_date, current_weekday, t1, t2, location, people, task)
             continue
 
-    if FILTER_BY_NAME:
+    # filter by name if requested
+    if filter_by_name:
         rows = [r for r in rows if re.search(rf"\b{re.escape(YOUR_NAME)}\b", r["People"], re.IGNORECASE)]
 
     rows = [r for r in rows if window_start <= r["_date"] <= window_end]
@@ -268,21 +327,21 @@ def parse_rows(subject: str, body: str) -> list[dict]:
     return unique
 
 def add_row(results, d: date, weekday: Optional[str], t1: str, t2: str, location: str, people: str, task: str):
-    t1n, t2n = normalize_time(t1), normalize_time(t2)
     day_name = weekday or datetime(d.year, d.month, d.day).strftime("%A")
-    title_text = task.strip() if task.strip() else f"{location or 'Shift'} {t1n}-{t2n}".strip()
+    time_str = normalize_time_range(t1, t2)
+    title_text = task.strip() if task.strip() else f"{location or 'Shift'} {time_str}".strip()
     results.append({
         "_title_content": title_text,
         "Day of the Week": day_name,
         "Date": d,
-        "Time": f"{t1n} - {t2n}",
+        "Time": time_str,
         "Location": location,
         "People": people.strip(),
         "Task": task.strip(),
         "_date": d,
     })
 
-# Write to Notion
+# ---------- Notion ----------
 
 def get_db_schema(db_id: str):
     url = f"https://api.notion.com/v1/databases/{db_id}"
@@ -301,7 +360,7 @@ def find_title_prop(props: dict) -> str:
     for name, spec in props.items():
         if spec.get("type") == "title":
             return name
-    raise RuntimeError("No title property found in Notion database. Set NOTION_TITLE_PROP in .env")
+    raise RuntimeError("No title property found in Notion database. Set NOTION_TITLE_PROP in env")
 
 def fuzzy_get(props: dict, candidates: list[str], expected_types: list[str]) -> Optional[str]:
     lowered = {k.lower(): (k, v) for k, v in props.items()}
@@ -317,7 +376,7 @@ def fuzzy_get(props: dict, candidates: list[str], expected_types: list[str]) -> 
             return x[0]
     return None
 
-def notion_create(rows: list[dict]):
+def notion_create(rows: List[dict]):
     if not rows:
         logging.info("No shifts to write.")
         return
@@ -393,7 +452,7 @@ def notion_create(rows: list[dict]):
 
     logging.info("Done. Created %d pages.", created)
 
-# ---------------- main ----------------
+# ---------- main ----------
 
 def main():
     svc = gmail_service()
@@ -408,10 +467,19 @@ def main():
         with open("last_email.html", "w", encoding="utf-8") as f:
             f.write(html)
 
-    logging.info("Parsing schedule...")
-    rows = parse_rows(subject or "", body)
+    logging.info("Parsing schedule from subject: %s", subject)
+    rows = parse_rows(subject or "", body, filter_by_name=FILTER_BY_NAME)
+
+    if not rows and FILTER_BY_NAME:
+        # Try again without the filter to diagnose
+        all_rows = parse_rows(subject or "", body, filter_by_name=False)
+        logging.warning("Parsed zero rows with name filter. Without filter there would be %d row(s).", len(all_rows))
+        if all_rows:
+            logging.warning("Double check YOUR_NAME or how it appears in email. Example row: %s", all_rows[0])
+        return
+
     if not rows:
-        logging.warning("Parsed zero rows. If you only want your shifts, confirm YOUR_NAME or set FILTER_BY_NAME=false.")
+        logging.warning("Parsed zero rows. Tighten GMAIL_QUERY or inspect last_email.txt")
         return
 
     logging.info("Parsed %d row(s). Example: %s", len(rows), rows[0])
