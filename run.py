@@ -97,39 +97,72 @@ def html_to_text(html: str) -> str:
 
 # ---------- Pick the right email ----------
 
-DAY_HEADER_LINE = re.compile(r"^\s*\d{1,2}\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", re.IGNORECASE | re.MULTILINE)
+DAY_HEADER_LINE = re.compile(r"^\s*\d{1,2}\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+                             re.IGNORECASE | re.MULTILINE)
 # token like 12 PM, 12:30 PM, 830AM, 9AM
 TIME_TOKEN = r"(?:\d{1,2}(?::\d{2})?|\d{3,4})\s*(?:AM|PM|am|pm)?"
 TIME_RANGE_RE = re.compile(rf"{TIME_TOKEN}\s*-\s*{TIME_TOKEN}", re.IGNORECASE)
 
-def looks_like_schedule(subject: str, text: str) -> Tuple[int, dict]:
-    """Return a score and some metrics. Higher score means more likely to be the schedule."""
+WINDOW_SUBJECT_RE = re.compile(
+    r"\bschedule\b[^\\n]*?(?P<start_day>\d{1,2}(?:st|nd|rd|th)?)\s*[–-]\s*(?P<end_day>\d{1,2}(?:st|nd|rd|th)?)",
+    re.IGNORECASE,
+)
+
+def looks_like_schedule(subject: str, text: str, age_hours: float) -> tuple[int, dict]:
     subj = subject.lower()
     body = text or ""
+
     day_headers = len(DAY_HEADER_LINE.findall(body))
     time_ranges = len(TIME_RANGE_RE.findall(body))
-    has_window = "schedule for" in body.lower() or "schedule for" in subj
-    has_keyword = any(k in subj for k in ("schedule", "shifts"))
+
+    has_schedule_word = "schedule" in subj
+    has_window_phrase = "schedule for" in subj or "schedule for" in body.lower()
+    has_numeric_window = bool(re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s*[–-]\s*\d{1,2}(?:st|nd|rd|th)?\b", subj))
+
     score = 0
-    score += 3 if day_headers >= 2 else day_headers
-    score += 2 if time_ranges >= 4 else time_ranges
-    if has_window: score += 2
-    if has_keyword: score += 1
-    # penalize obvious debriefs
-    if "debrief" in subj:
+    score += min(day_headers, 5)               # up to +5 for day headers
+    score += min(time_ranges // 10, 5)         # up to +5 for lots of time rows
+    if has_schedule_word:
+        score += 2
+    if has_window_phrase or has_numeric_window:
+        score += 2
+
+    # Penalize “debrief” only if the subject does not also say schedule
+    if "debrief" in subj and not has_schedule_word:
         score -= 3
-    return score, {"day_headers": day_headers, "time_ranges": time_ranges, "has_window": has_window}
+
+    # Recency bonus
+    if age_hours <= 24:
+        score += 4
+    elif age_hours <= 72:
+        score += 2
+    elif age_hours <= 168:
+        score += 1
+
+    metrics = {
+        "day_headers": day_headers,
+        "time_ranges": time_ranges,
+        "has_window_phrase": has_window_phrase,
+        "has_numeric_window": has_numeric_window,
+        "age_hours": round(age_hours, 1),
+    }
+    return score, metrics
+
 
 def fetch_latest_email(svc):
     resp = svc.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
     msgs = resp.get("messages", [])
     if not msgs:
         return None, None, ""
+
     # newest first by id as a rough proxy
     msgs = list(reversed(sorted(msgs, key=lambda m: m["id"])))
+
     best = None
-    best_score = -999
+    best_score = -10**9
     best_metrics = {}
+    best_age = 10**9
+
     for m in msgs:
         full = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
         payload = full.get("payload", {})
@@ -139,14 +172,24 @@ def fetch_latest_email(svc):
         html = extract_raw_html(payload)
         if not text:
             continue
-        score, metrics = looks_like_schedule(subject, text)
-        if score > best_score:
+
+        # internalDate is ms since epoch
+        internal_ms = int(full.get("internalDate", "0"))
+        age_hours = (datetime.utcnow() - datetime.utcfromtimestamp(internal_ms / 1000)).total_seconds() / 3600.0
+
+        score, metrics = looks_like_schedule(subject, text, age_hours)
+
+        # Prefer higher score, break near ties by recency
+        if (score > best_score) or (score == best_score and age_hours < best_age):
             best = (subject, text, html)
             best_score = score
             best_metrics = metrics
+            best_age = age_hours
+
     if best:
         logging.info("Chosen email: %s | score=%s metrics=%s", best[0], best_score, best_metrics)
     return best if best else (None, None, "")
+
 
 # ---------- Parsing ----------
 
@@ -178,34 +221,57 @@ def month_from_text(s: str) -> Optional[int]:
     return None
 
 def parse_window(text: str, now: datetime) -> tuple[date, date]:
+    # First try full “schedule for September 1st - 14th”
     m = WINDOW_RE.search(text)
-    if not m:
-        ws = get_week_start(now).date()
-        return ws, ws + timedelta(days=6)
-    start_str = m.group("start")
-    end_day_str = m.group("end_day")
-    month = month_from_text(start_str) or now.month
-    start_day = int(re.sub(r"\D", "", start_str))
-    start = date(now.year, month, start_day)
-    if (start - now.date()).days > 120:
-        start = date(now.year - 1, month, start_day)
-    if (now.date() - start).days > 250:
-        start = date(now.year + 1, month, start_day)
-    end_day = int(re.sub(r"\D", "", end_day_str))
-    try:
-        end = date(start.year, month, end_day)
-    except ValueError:
-        last = (date(start.year, month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
-        end = last
-    if end < start:
-        nm_year = start.year + (1 if month == 12 else 0)
-        nm_month = 1 if month == 12 else month + 1
+    if m:
+        start_str = m.group("start")
+        end_day_str = m.group("end_day")
+        month = month_from_text(start_str) or now.month
+        start_day = int(re.sub(r"\\D", "", start_str))
+        start = date(now.year, month, start_day)
+        if (start - now.date()).days > 120:
+            start = date(now.year - 1, month, start_day)
+        if (now.date() - start).days > 250:
+            start = date(now.year + 1, month, start_day)
+        end_day = int(re.sub(r"\\D", "", end_day_str))
         try:
-            end = date(nm_year, nm_month, end_day)
+            end = date(start.year, month, end_day)
         except ValueError:
-            last = (date(nm_year, nm_month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
+            last = (date(start.year, month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
             end = last
-    return start, end
+        if end < start:
+            nm_year = start.year + (1 if month == 12 else 0)
+            nm_month = 1 if month == 12 else month + 1
+            try:
+                end = date(nm_year, nm_month, end_day)
+            except ValueError:
+                last = (date(nm_year, nm_month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
+                end = last
+        return start, end
+
+    # Fallback for subjects like “Schedule 15th - 30th”
+    m2 = WINDOW_SUBJECT_RE.search(text)
+    if m2:
+        month = now.month
+        start_day = int(re.sub(r"\\D", "", m2.group("start_day")))
+        end_day = int(re.sub(r"\\D", "", m2.group("end_day")))
+        start = date(now.year, month, start_day)
+        try:
+            end = date(now.year, month, end_day)
+        except ValueError:
+            last = (date(now.year, month, 1) + timedelta(days=40)).replace(day=1) - timedelta(days=1)
+            end = last
+        if end < start:
+            # cross month
+            nm_year = now.year + (1 if month == 12 else 0)
+            nm_month = 1 if month == 12 else month + 1
+            end = date(nm_year, nm_month, end_day if end_day <= 28 else 28)
+        return start, end
+
+    # No explicit window found, default to current week
+    ws = get_week_start(now).date()
+    return ws, ws + timedelta(days=6)
+
 
 def get_week_start(dt: datetime) -> datetime:
     return (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
