@@ -26,7 +26,7 @@ jobs:
             echo "ok=true" >> $GITHUB_OUTPUT
             echo "Running. day_offset=$days"
           else
-            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "ok=true" >> $GITHUB_OUTPUT
             echo "Skipping. day_offset=$days"
           fi
 
